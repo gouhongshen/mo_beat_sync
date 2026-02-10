@@ -1,0 +1,6 @@
+numpy>=1.26,<3
+opencv-python>=4.10
+librosa>=0.10.2
+soundfile>=0.12
+PyMySQL>=1.1
+python-dotenv>=1.0
