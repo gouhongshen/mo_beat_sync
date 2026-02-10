@@ -1,44 +1,48 @@
 # MatrixOne Beat Sync Pipeline
 
-这个项目会把 `source_movies/` 的电影素材和 `source_songs/` 的音乐自动处理成一条踩点视频，且全程不训练模型。
+This project automatically generates a beat-synced short video from:
+- movie sources in `source_movies/`
+- music sources in `source_songs/`
 
-流程：
-1. 扫描素材目录。
-2. 从音乐中提取节拍和强弱（`librosa`）。
-3. 把每部电影按时长切成多个块（默认 2~5 分钟），并发处理每个块。
-4. 用 `ffmpeg`（可启用 CUDA 解码）按低帧率抽样，再做镜头切分和片段特征提取（支持块间 overlap，默认 1.5 秒）。
-5. 把片段特征与向量写入 MatrixOne（`vecf32(96)`）。
-6. 用 MatrixOne 向量检索 + SQL 打分生成剪辑计划。
-7. 用 `ffmpeg`（可启用 NVENC 编码）自动渲染并叠加音乐输出最终视频。
+No model training is required.
 
-## 1. 目录约定
+Pipeline overview:
+1. Scan media folders.
+2. Extract beat timing and beat strength from music (`librosa`).
+3. Split each movie into time chunks (default: 2-5 minutes) and process chunks in parallel.
+4. Sample frames with `ffmpeg` (CUDA decode optional), then run scene detection and feature extraction (supports chunk overlap, default: 1.5s).
+5. Store clip features and embeddings in MatrixOne (`vecf32(96)`).
+6. Use MatrixOne vector retrieval + SQL scoring to build an edit plan.
+7. Render the final video with `ffmpeg` (NVENC optional) and mix with music.
 
-在项目根目录下放置：
-- `source_movies/`：十几部电影素材（mp4/mkv/mov...）
-- `source_songs/`：十几首音乐（mp3/wav/m4a...）
+## 1. Folder Layout
 
-输出：
+Under project root:
+- `source_movies/`: movie assets (`mp4/mkv/mov/...`)
+- `source_songs/`: music assets (`mp3/wav/m4a/...`)
+
+Outputs:
 - `outputs/final/beat_sync.mp4`
 - `workdir/run_<run_id>/report.json`
 
-## 2. 启动 MatrixOne（可选参考）
+## 2. Start MatrixOne (Optional Reference)
 
-如果你本地还没起服务，可在 MatrixOne 仓库下执行：
+If MatrixOne is not running, from your MatrixOne repo:
 
 ```bash
 source $HOME/.zshrc && moenv
 ./mo-service -debug-http=:11235 -launch etc/launch/launch.toml > log.log 2>&1 &
 ```
 
-验证连接：
+Connection check:
 
 ```bash
 mysql -h 127.0.0.1 -P 6001 -u root -p111 -e "select 1"
 ```
 
-## 3. 安装依赖并运行
+## 3. Install and Run
 
-### 一键运行
+### One-command Run
 
 Linux/macOS:
 
@@ -64,7 +68,7 @@ $env:MO_CHUNK_OVERLAP_SECONDS="1.5"
 ./scripts/run_full.ps1
 ```
 
-### 手动运行
+### Manual Run
 
 ```bash
 cd /Users/ghs-mo/MOWorkSpace/experiments/mo_beat_sync
@@ -79,7 +83,7 @@ PYTHONPATH=src python -m mo_beat_sync \
   --workdir workdir
 ```
 
-## 4. 常用参数
+## 4. Common Parameters
 
 ```bash
 PYTHONPATH=src python -m mo_beat_sync \
@@ -97,31 +101,31 @@ PYTHONPATH=src python -m mo_beat_sync \
   --drop-existing
 ```
 
-数据库参数可通过命令行或环境变量：
+Environment variables:
 - `MO_HOST` `MO_PORT` `MO_USER` `MO_PASSWORD` `MO_DATABASE`
-- `MO_WORKERS`（电影并发处理进程数）
-- `MO_GPU_MODE`（`auto/on/off`）
+- `MO_WORKERS` (parallel movie workers)
+- `MO_GPU_MODE` (`auto/on/off`)
 - `MO_CHUNK_MIN_MINUTES` `MO_CHUNK_MAX_MINUTES`
 - `MO_CHUNK_OVERLAP_SECONDS`
 
-## 5. MatrixOne 用到的能力
+## 5. MatrixOne Capabilities Used
 
-- 向量列：`clips.embedding vecf32(96)`
-- 向量函数：`l2_distance(embedding, '[...]')`
-- 向量索引：`HNSW`（若集群支持会自动创建）
-- 分析 SQL：统计片段分布、运动强度、各素材贡献等
+- Vector column: `clips.embedding vecf32(96)`
+- Vector distance: `l2_distance(embedding, '[...]')`
+- Vector index: `HNSW` (created automatically if supported)
+- SQL analytics: clip distribution, motion strength, source contribution
 
-## 6. Windows + GPU 建议
+## 6. Windows + GPU Notes
 
-如果你是 Windows + RTX 4080，建议：
-1. 确保 `ffmpeg -hwaccels` 能看到 `cuda`，且 `ffmpeg -encoders` 有 `h264_nvenc`。
-2. 运行时设置：`--gpu-mode on --workers 10 --chunk-min-minutes 2 --chunk-max-minutes 5`。
-   建议加上 `--chunk-overlap-seconds 1.5`，减少块边界丢片段。
-3. 如果出现驱动/编解码兼容问题，先切到 `--gpu-mode auto`，程序会回退到 CPU 路径。
+For Windows + RTX 4080:
+1. Ensure `ffmpeg -hwaccels` contains `cuda`.
+2. Ensure `ffmpeg -encoders` contains `h264_nvenc`.
+3. Recommended runtime args: `--gpu-mode on --workers 10 --chunk-min-minutes 2 --chunk-max-minutes 5 --chunk-overlap-seconds 1.5`.
+4. If driver/codec compatibility issues happen, use `--gpu-mode auto` to allow CPU fallback.
 
-## 7. 数据表
+## 7. Tables
 
-自动创建以下表：
+The pipeline creates:
 - `pipeline_runs`
 - `songs`
 - `song_beats`
@@ -129,27 +133,27 @@ PYTHONPATH=src python -m mo_beat_sync \
 - `edit_plans`
 - `plan_items`
 
-## 8. 示例分析 SQL
+## 8. Example SQL
 
 ```sql
 use mo_beat_sync;
 
--- 每个素材贡献了多少候选片段
+-- Clip contribution by source movie
 select movie_path, count(*) as clips
 from clips
 group by movie_path
 order by clips desc
 limit 20;
 
--- 查看某次计划的片段质量
+-- Plan item quality for a specific plan
 select slot_idx, clip_id, score, vec_distance, energy_distance, target_duration_s
 from plan_items
 where plan_id = 1
 order by slot_idx;
 ```
 
-## 9. 注意事项
+## 9. Notes
 
-- 首次跑依赖下载会比较慢。
-- 电影素材较大时，特征提取会花较久（取决于机器性能）。
-- 如果 MatrixOne 没有启用向量索引，本项目仍可运行，只是召回性能会下降。
+- First run may take longer because dependencies are installed.
+- Large movie assets can make feature extraction slow, depending on CPU/GPU and disk throughput.
+- If vector index is unavailable in MatrixOne, the pipeline still works but retrieval may be slower.
