@@ -8,12 +8,13 @@ No model training is required.
 
 Pipeline overview:
 1. Scan media folders.
-2. Extract beat timing and beat strength from music (`librosa`).
+2. Extract beat timing, structural boundaries, and a tension curve from music (`madmom/librosa`).
 3. Split each movie into time chunks (default: 2-5 minutes) and process chunks in parallel.
 4. Sample frames with `ffmpeg` (CUDA decode optional), then run scene detection and feature extraction (supports chunk overlap, default: 1.5s).
 5. Store clip features and embeddings in MatrixOne (`vecf32(96)`).
-6. Use MatrixOne vector retrieval + SQL scoring to build an edit plan.
-7. Render the final video with `ffmpeg` (NVENC optional) and mix with music.
+6. Reuse cached song/video analysis by checksum when inputs are unchanged.
+7. Use MatrixOne vector retrieval + SQL scoring (duration + energy + tension + transition) to build an edit plan.
+8. Render the final video with `ffmpeg` (NVENC optional) and mix with music.
 
 ## 1. Folder Layout
 
@@ -90,6 +91,13 @@ PYTHONPATH=src python -m mo_beat_sync \
   --song-keyword "edm" \
   --target-duration-s 60 \
   --beats-per-clip 2 \
+  --beat-model auto \
+  --embedding-model auto \
+  --planner-beam-width 10 \
+  --planner-per-state-candidates 18 \
+  --planner-slot-skip-penalty 0.45 \
+  --planner-min-reuse-gap 4 \
+  --planner-reuse-penalty 0.14 \
   --gpu-mode on \
   --workers 6 \
   --chunk-min-minutes 2 \
@@ -103,8 +111,17 @@ PYTHONPATH=src python -m mo_beat_sync \
 
 Environment variables:
 - `MO_HOST` `MO_PORT` `MO_USER` `MO_PASSWORD` `MO_DATABASE`
-- `MO_WORKERS` (parallel movie workers)
+- `MO_WORKERS` (parallel chunk workers)
 - `MO_GPU_MODE` (`auto/on/off`)
+- `MO_BEAT_MODEL` (`auto/librosa/madmom`)
+- `MO_EMBEDDING_MODEL` (`auto/hist96/clip`)
+- `MO_PLANNER_BEAM_WIDTH` (default `10`)
+- `MO_PLANNER_PER_STATE_CANDIDATES` (default `18`)
+- `MO_PLANNER_SLOT_SKIP_PENALTY` (default `0.45`)
+- `MO_PLANNER_MIN_REUSE_GAP` (default `4`)
+- `MO_PLANNER_REUSE_PENALTY` (default `0.14`)
+- `MO_INSTALL_ML` (`1` means install `requirements-ml.txt` in run scripts)
+- `MO_INSTALL_MADMOM` (`1` means try to install `requirements-ml-beat.txt`; failure falls back to librosa)
 - `MO_CHUNK_MIN_MINUTES` `MO_CHUNK_MAX_MINUTES`
 - `MO_CHUNK_OVERLAP_SECONDS`
 
@@ -112,18 +129,41 @@ Environment variables:
 
 - Vector column: `clips.embedding vecf32(96)`
 - Vector distance: `l2_distance(embedding, '[...]')`
-- Vector index: `HNSW` (created automatically if supported)
-- SQL analytics: clip distribution, motion strength, source contribution
+- Vector index: `IVF Flat` (created automatically if supported)
+- SQL scoring analytics: duration distance, energy distance, tension distance, transition distance
+- Post-run analytics in `report.json`: boundary slot counts, average tension/transition distances
+- Input cache keys: song/video SHA-256 checksum + processing signature
 
-## 6. Windows + GPU Notes
+## 6. Optional Pretrained Models (No Training)
+
+You can improve beat and visual semantic quality with pretrained small models:
+- Beat tracking: `madmom` (`--beat-model madmom` or `auto`)
+- Visual embedding: `CLIP ViT-B/32` via `transformers` (`--embedding-model clip` or `auto`)
+
+Install optional dependencies:
+
+```bash
+pip install -r requirements-ml.txt
+```
+
+Install optional madmom beat backend (may fail on some platforms/Python toolchains):
+
+```bash
+pip install -r requirements-ml-beat.txt
+```
+
+If these packages are not installed, `auto` mode falls back to baseline (`librosa` + `hist96`) automatically.
+
+## 7. Windows + GPU Notes
 
 For Windows + RTX 4080:
 1. Ensure `ffmpeg -hwaccels` contains `cuda`.
 2. Ensure `ffmpeg -encoders` contains `h264_nvenc`.
 3. Recommended runtime args: `--gpu-mode on --workers 10 --chunk-min-minutes 2 --chunk-max-minutes 5 --chunk-overlap-seconds 1.5`.
+   `workers` is chunk-level now, so it can speed up even with a single movie.
 4. If driver/codec compatibility issues happen, use `--gpu-mode auto` to allow CPU fallback.
 
-## 7. Tables
+## 8. Tables
 
 The pipeline creates:
 - `pipeline_runs`
@@ -133,7 +173,7 @@ The pipeline creates:
 - `edit_plans`
 - `plan_items`
 
-## 8. Example SQL
+## 9. Example SQL
 
 ```sql
 use mo_beat_sync;
@@ -152,7 +192,7 @@ where plan_id = 1
 order by slot_idx;
 ```
 
-## 9. Notes
+## 10. Notes
 
 - First run may take longer because dependencies are installed.
 - Large movie assets can make feature extraction slow, depending on CPU/GPU and disk throughput.

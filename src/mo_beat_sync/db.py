@@ -55,6 +55,12 @@ class MatrixOneClient:
             affected = cur.executemany(sql, list(params))
         return affected
 
+    def _exec_ignore_error(self, sql: str) -> None:
+        try:
+            self._exec(sql)
+        except Exception:
+            pass
+
     def ensure_schema(self, drop_existing: bool = False) -> None:
         self._exec(f"create database if not exists `{self.database}`")
         self._exec(f"use `{self.database}`")
@@ -85,8 +91,12 @@ class MatrixOneClient:
                 duration_s double not null,
                 bpm double not null,
                 beat_count int not null,
+                checksum varchar(64) not null default '',
+                analysis_sig varchar(128) not null default '',
+                analysis_json longtext,
                 created_at timestamp default current_timestamp,
-                key idx_song_run (run_id)
+                key idx_song_run (run_id),
+                key idx_song_cache (checksum, analysis_sig)
             )
             """
         )
@@ -109,6 +119,8 @@ class MatrixOneClient:
                 clip_id bigint auto_increment primary key,
                 run_id bigint not null,
                 movie_path varchar(2048) not null,
+                movie_checksum varchar(64) not null default '',
+                feature_sig varchar(128) not null default '',
                 start_s double not null,
                 end_s double not null,
                 duration_s double not null,
@@ -118,6 +130,7 @@ class MatrixOneClient:
                 embedding vecf32({self.embedding_dim}),
                 created_at timestamp default current_timestamp,
                 key idx_clips_run (run_id),
+                key idx_clips_asset (movie_checksum, feature_sig),
                 key idx_clips_duration (duration_s),
                 key idx_clips_motion (motion_energy)
             )
@@ -158,18 +171,44 @@ class MatrixOneClient:
             """
         )
 
+        self._exec_ignore_error("alter table songs add column checksum varchar(64) not null default ''")
+        self._exec_ignore_error("alter table songs add column analysis_sig varchar(128) not null default ''")
+        self._exec_ignore_error("alter table songs add column analysis_json longtext")
+        self._exec_ignore_error("create index idx_song_cache on songs(checksum, analysis_sig)")
+        self._exec_ignore_error("set experimental_hnsw_index=1")
+        self._exec_ignore_error("alter table clips add column movie_checksum varchar(64) not null default ''")
+        self._exec_ignore_error("alter table clips add column feature_sig varchar(128) not null default ''")
+        self._exec_ignore_error("create index idx_clips_asset on clips(movie_checksum, feature_sig)")
+        self._exec_ignore_error("drop index idx_clips_embedding_hnsw on clips")
+
         try:
-            self._exec("set experimental_hnsw_index=1")
-            self._exec(
-                """
-                create index idx_clips_embedding_hnsw
-                using hnsw on clips(embedding)
-                op_type "vector_l2_ops" m 32 ef_construction 64 ef_search 64
-                """
-            )
+            self._exec("set experimental_ivf_index=1")
         except Exception:
-            # Index already exists or vector index is disabled.
             pass
+
+        ivf_sql_candidates = (
+            """
+            create index idx_clips_embedding_ivf
+            using ivfflat on clips(embedding)
+            op_type "vector_l2_ops" lists 256
+            """,
+            """
+            create index idx_clips_embedding_ivf
+            using ivfflat on clips(embedding)
+            lists 256 op_type "vector_l2_ops"
+            """,
+            """
+            create index idx_clips_embedding_ivf
+            using ivfflat on clips(embedding)
+            lists 256
+            """,
+        )
+        for sql in ivf_sql_candidates:
+            try:
+                self._exec(sql)
+                break
+            except Exception:
+                continue
 
     def start_run(self, config: dict) -> int:
         with self.conn.cursor() as cur:
@@ -187,13 +226,35 @@ class MatrixOneClient:
         )
 
     def insert_song(self, run_id: int, song: SongAnalysis) -> int:
+        analysis_json = json.dumps(
+            {
+                "tension_times": song.tension_times,
+                "tension_values": song.tension_values,
+                "structure_times": song.structure_times,
+                "structure_strengths": song.structure_strengths,
+            },
+            ensure_ascii=False,
+        )
         with self.conn.cursor() as cur:
             cur.execute(
                 """
-                insert into songs(run_id, path, wav_path, duration_s, bpm, beat_count)
-                values(%s,%s,%s,%s,%s,%s)
+                insert into songs(
+                    run_id, path, wav_path, duration_s, bpm, beat_count,
+                    checksum, analysis_sig, analysis_json
+                )
+                values(%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (run_id, song.path, song.wav_path, song.duration_s, song.bpm, len(song.beat_times)),
+                (
+                    run_id,
+                    song.path,
+                    song.wav_path,
+                    song.duration_s,
+                    song.bpm,
+                    len(song.beat_times),
+                    song.checksum,
+                    song.analysis_sig,
+                    analysis_json,
+                ),
             )
             song_id = int(cur.lastrowid)
 
@@ -213,6 +274,8 @@ class MatrixOneClient:
             (
                 run_id,
                 clip.movie_path,
+                clip.movie_checksum,
+                clip.feature_sig,
                 clip.start_s,
                 clip.end_s,
                 clip.duration_s,
@@ -226,24 +289,187 @@ class MatrixOneClient:
         return self._executemany(
             """
             insert into clips(
-                run_id, movie_path, start_s, end_s, duration_s,
+                run_id, movie_path, movie_checksum, feature_sig, start_s, end_s, duration_s,
                 motion_energy, brightness, saturation, embedding
-            ) values(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             rows,
         )
 
-    def query_clip_candidates(
+    def find_song_cache(self, checksum: str, analysis_sig: str) -> dict | None:
+        rows = self._query(
+            """
+            select song_id
+            from songs
+            where checksum=%s and analysis_sig=%s
+            order by song_id desc
+            limit 1
+            """,
+            (checksum, analysis_sig),
+        )
+        return rows[0] if rows else None
+
+    def load_song_analysis(self, song_id: int) -> SongAnalysis:
+        rows = self._query(
+            """
+            select
+                song_id, path, wav_path, duration_s, bpm, checksum, analysis_sig, analysis_json
+            from songs
+            where song_id=%s
+            limit 1
+            """,
+            (song_id,),
+        )
+        if not rows:
+            raise RuntimeError(f"Song not found: song_id={song_id}")
+        row = rows[0]
+        beat_rows = self._query(
+            """
+            select ts_s, strength
+            from song_beats
+            where song_id=%s
+            order by beat_idx asc
+            """,
+            (song_id,),
+        )
+        beat_times = [float(x["ts_s"]) for x in beat_rows]
+        beat_strengths = [float(x["strength"]) for x in beat_rows]
+
+        payload = {}
+        raw_json = row.get("analysis_json")
+        if raw_json:
+            if isinstance(raw_json, bytes):
+                raw_json = raw_json.decode("utf-8")
+            try:
+                payload = json.loads(str(raw_json))
+            except Exception:
+                payload = {}
+
+        return SongAnalysis(
+            path=str(row["path"]),
+            wav_path=str(row["wav_path"]),
+            duration_s=float(row["duration_s"]),
+            bpm=float(row["bpm"]),
+            beat_times=beat_times,
+            beat_strengths=beat_strengths,
+            tension_times=[float(x) for x in payload.get("tension_times", [])],
+            tension_values=[float(x) for x in payload.get("tension_values", [])],
+            structure_times=[float(x) for x in payload.get("structure_times", [])],
+            structure_strengths=[float(x) for x in payload.get("structure_strengths", [])],
+            checksum=str(row.get("checksum", "") or ""),
+            analysis_sig=str(row.get("analysis_sig", "") or ""),
+        )
+
+    def clone_song_to_run(
         self,
         run_id: int,
+        cached_song_id: int,
+        song_path: str,
+        wav_path: str,
+    ) -> int:
+        cached = self._query(
+            """
+            select duration_s, bpm, beat_count, checksum, analysis_sig, analysis_json
+            from songs
+            where song_id=%s
+            limit 1
+            """,
+            (cached_song_id,),
+        )
+        if not cached:
+            raise RuntimeError(f"Cached song not found: song_id={cached_song_id}")
+        c = cached[0]
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into songs(
+                    run_id, path, wav_path, duration_s, bpm, beat_count,
+                    checksum, analysis_sig, analysis_json
+                ) values(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    run_id,
+                    song_path,
+                    wav_path,
+                    float(c["duration_s"]),
+                    float(c["bpm"]),
+                    int(c["beat_count"]),
+                    str(c.get("checksum", "") or ""),
+                    str(c.get("analysis_sig", "") or ""),
+                    c.get("analysis_json"),
+                ),
+            )
+            new_song_id = int(cur.lastrowid)
+        self._exec(
+            """
+            insert into song_beats(song_id, beat_idx, ts_s, strength)
+            select %s, beat_idx, ts_s, strength
+            from song_beats
+            where song_id=%s
+            """,
+            (new_song_id, cached_song_id),
+        )
+        return new_song_id
+
+    def count_cached_clips(self, movie_checksum: str, feature_sig: str) -> int:
+        rows = self._query(
+            """
+            select count(*) as clip_count
+            from clips
+            where movie_checksum=%s and feature_sig=%s
+            """,
+            (movie_checksum, feature_sig),
+        )
+        if not rows:
+            return 0
+        return int(rows[0]["clip_count"] or 0)
+
+    def count_clips_for_assets(self, movie_checksums: Sequence[str], feature_sig: str) -> int:
+        checksums = [x for x in movie_checksums if x]
+        if not checksums:
+            return 0
+        placeholders = ",".join(["%s"] * len(checksums))
+        rows = self._query(
+            f"""
+            select count(*) as clip_count
+            from clips
+            where feature_sig=%s and movie_checksum in ({placeholders})
+            """,
+            (feature_sig, *checksums),
+        )
+        if not rows:
+            return 0
+        return int(rows[0]["clip_count"] or 0)
+
+    def query_clip_candidates(
+        self,
+        movie_checksums: Sequence[str],
+        feature_sig: str,
         target_duration_s: float,
         target_energy: float,
+        target_tension: float,
+        boundary_strength: float,
         prev_embedding_literal: str | None,
         limit: int,
         duration_tol: float,
     ) -> List[dict]:
+        checksums = [x for x in movie_checksums if x]
+        if not checksums:
+            return []
         min_d = max(0.2, target_duration_s * (1.0 - duration_tol))
         max_d = target_duration_s * (1.0 + duration_tol)
+        target_tension = max(0.0, min(1.0, float(target_tension)))
+        boundary_strength = max(0.0, min(1.0, float(boundary_strength)))
+        target_transition = 0.10 + 0.80 * boundary_strength
+        raw_tension_expr = "(0.62 * motion_energy + 0.23 * saturation + 0.15 * brightness)"
+        clip_tension_expr = (
+            f"(case "
+            f"when {raw_tension_expr} < cast(0 as double) then cast(0 as double) "
+            f"when {raw_tension_expr} > cast(1 as double) then cast(1 as double) "
+            f"else cast({raw_tension_expr} as double) end)"
+        )
+
+        placeholders = ",".join(["%s"] * len(checksums))
 
         if prev_embedding_literal is not None:
             sql = """
@@ -254,28 +480,44 @@ class MatrixOneClient:
                     end_s,
                     duration_s,
                     motion_energy,
+                    brightness,
+                    saturation,
                     embedding,
+                    """
+            sql += f"""
+                    {clip_tension_expr} as clip_tension,
                     l2_distance(embedding, %s) as vec_distance,
+                    abs(l2_distance(embedding, %s) - %s) as transition_distance,
                     abs(motion_energy - %s) as energy_distance,
+                    abs(({clip_tension_expr}) - %s) as tension_distance,
                     abs(duration_s - %s) as duration_distance,
                     (
-                        0.55 * l2_distance(embedding, %s)
-                        + 0.30 * abs(motion_energy - %s)
-                        + 0.15 * abs(duration_s - %s)
+                        0.26 * abs(duration_s - %s)
+                        + 0.20 * abs(motion_energy - %s)
+                        + 0.24 * abs(({clip_tension_expr}) - %s)
+                        + 0.30 * abs(l2_distance(embedding, %s) - %s)
                     ) as score
                 from clips
-                where run_id = %s and duration_s between %s and %s
+                where feature_sig = %s and movie_checksum in ("""
+            sql += placeholders
+            sql += """) and duration_s between %s and %s
                 order by score asc
                 limit %s
             """
             params = (
                 prev_embedding_literal,
-                target_energy,
-                target_duration_s,
                 prev_embedding_literal,
+                target_transition,
                 target_energy,
+                target_tension,
                 target_duration_s,
-                run_id,
+                target_duration_s,
+                target_energy,
+                target_tension,
+                prev_embedding_literal,
+                target_transition,
+                feature_sig,
+                *checksums,
                 min_d,
                 max_d,
                 limit,
@@ -289,25 +531,38 @@ class MatrixOneClient:
                     end_s,
                     duration_s,
                     motion_energy,
+                    brightness,
+                    saturation,
                     embedding,
+                    """
+            sql += f"""
+                    {clip_tension_expr} as clip_tension,
                     0.0 as vec_distance,
+                    0.0 as transition_distance,
                     abs(motion_energy - %s) as energy_distance,
+                    abs(({clip_tension_expr}) - %s) as tension_distance,
                     abs(duration_s - %s) as duration_distance,
                     (
-                        0.70 * abs(motion_energy - %s)
-                        + 0.30 * abs(duration_s - %s)
+                        0.34 * abs(duration_s - %s)
+                        + 0.30 * abs(motion_energy - %s)
+                        + 0.36 * abs(({clip_tension_expr}) - %s)
                     ) as score
                 from clips
-                where run_id = %s and duration_s between %s and %s
+                where feature_sig = %s and movie_checksum in ("""
+            sql += placeholders
+            sql += """) and duration_s between %s and %s
                 order by score asc
                 limit %s
             """
             params = (
                 target_energy,
+                target_tension,
+                target_duration_s,
                 target_duration_s,
                 target_energy,
-                target_duration_s,
-                run_id,
+                target_tension,
+                feature_sig,
+                *checksums,
                 min_d,
                 max_d,
                 limit,

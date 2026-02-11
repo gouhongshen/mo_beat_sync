@@ -47,7 +47,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=int,
         default=int(os.getenv("MO_WORKERS", "0") or "0"),
-        help="Movie processing workers. 0 means use pipeline default.",
+        help="Chunk processing workers. 0 means use pipeline default.",
+    )
+    parser.add_argument(
+        "--beat-model",
+        choices=["auto", "librosa", "madmom"],
+        default=os.getenv("MO_BEAT_MODEL", "auto"),
+        help="Beat tracking backend.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        choices=["auto", "hist96", "clip"],
+        default=os.getenv("MO_EMBEDDING_MODEL", "auto"),
+        help="Clip embedding backend.",
+    )
+    parser.add_argument(
+        "--planner-beam-width",
+        type=int,
+        default=int(os.getenv("MO_PLANNER_BEAM_WIDTH", "10")),
+        help="Beam width for global clip planning.",
+    )
+    parser.add_argument(
+        "--planner-per-state-candidates",
+        type=int,
+        default=int(os.getenv("MO_PLANNER_PER_STATE_CANDIDATES", "18")),
+        help="Candidate count expanded per beam state and slot.",
+    )
+    parser.add_argument(
+        "--planner-slot-skip-penalty",
+        type=float,
+        default=float(os.getenv("MO_PLANNER_SLOT_SKIP_PENALTY", "0.45")),
+        help="Penalty when a slot cannot be matched.",
+    )
+    parser.add_argument(
+        "--planner-min-reuse-gap",
+        type=int,
+        default=int(os.getenv("MO_PLANNER_MIN_REUSE_GAP", "4")),
+        help="Minimum slot gap before reusing the same source clip.",
+    )
+    parser.add_argument(
+        "--planner-reuse-penalty",
+        type=float,
+        default=float(os.getenv("MO_PLANNER_REUSE_PENALTY", "0.14")),
+        help="Penalty factor for reused clips.",
     )
 
     parser.add_argument("--scene-threshold", type=float, default=0.42)
@@ -100,6 +142,13 @@ def main() -> int:
         gpu_mode=args.gpu_mode,
         workers=args.workers if args.workers > 0 else PipelineConfig.workers,
         song_keyword=args.song_keyword,
+        beat_model=args.beat_model,
+        embedding_model=args.embedding_model,
+        planner_beam_width=args.planner_beam_width,
+        planner_per_state_candidates=args.planner_per_state_candidates,
+        planner_slot_skip_penalty=args.planner_slot_skip_penalty,
+        planner_min_reuse_gap=args.planner_min_reuse_gap,
+        planner_reuse_penalty=args.planner_reuse_penalty,
     )
 
     try:

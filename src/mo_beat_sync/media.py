@@ -5,6 +5,7 @@ import math
 import shutil
 import subprocess
 import tempfile
+import hashlib
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
@@ -20,6 +21,10 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
 
 class MediaError(RuntimeError):
     pass
+
+
+_CLIP_RUNTIME: dict | None = None
+_CLIP_PROJECTOR: np.ndarray | None = None
 
 
 def detect_ffmpeg_capabilities() -> dict:
@@ -57,6 +62,17 @@ def run_cmd(cmd: Sequence[str]) -> str:
     if proc.returncode != 0:
         raise MediaError(f"Command failed: {' '.join(cmd)}\n{proc.stderr.strip()}")
     return proc.stdout
+
+
+def file_sha256(path: str, chunk_size: int = 4 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk_size)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
 
 
 def ffprobe_json(path: str) -> dict:
@@ -116,31 +132,267 @@ def convert_audio_to_wav(song_path: str, wav_path: str, sample_rate: int = 22050
     )
 
 
-def analyze_song(song_path: str, wav_dir: str, sample_rate: int = 22050) -> SongAnalysis:
+def _try_madmom_beats(wav_path: str) -> List[float]:
+    try:
+        from madmom.features.beats import DBNBeatTrackingProcessor, RNNBeatProcessor
+    except Exception:
+        return []
+    try:
+        activations = RNNBeatProcessor()(wav_path)
+        beats = DBNBeatTrackingProcessor(fps=100)(activations)
+        return [float(x) for x in beats]
+    except Exception:
+        return []
+
+
+def _resolve_beat_times(
+    y: np.ndarray,
+    sr: int,
+    wav_path: str,
+    hop_length: int,
+    beat_model: str,
+) -> Tuple[List[float], float]:
+    mode = (beat_model or "auto").lower().strip()
+    if mode not in {"auto", "librosa", "madmom"}:
+        mode = "auto"
+
+    if mode in {"auto", "madmom"}:
+        madmom_beats = _try_madmom_beats(wav_path)
+        if madmom_beats:
+            if len(madmom_beats) >= 2:
+                intervals = np.diff(np.asarray(madmom_beats, dtype=np.float32))
+                valid = intervals[intervals > 1e-6]
+                median_interval = float(np.median(valid)) if valid.size > 0 else 0.0
+                bpm = 60.0 / median_interval if median_interval > 1e-6 else 120.0
+            else:
+                bpm = 120.0
+            return madmom_beats, bpm
+        if mode == "madmom":
+            raise MediaError("beat_model=madmom requested but madmom is unavailable or failed")
+
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length, units="frames")
+    beats = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length).tolist()
+    bpm = float(tempo) if np.size(tempo) == 1 else float(np.mean(tempo))
+    return beats, bpm
+
+
+def _ensure_clip_runtime() -> dict | None:
+    global _CLIP_RUNTIME
+    if _CLIP_RUNTIME is not None:
+        return _CLIP_RUNTIME
+    try:
+        import torch
+        from PIL import Image
+        from transformers import CLIPModel, CLIPProcessor
+    except Exception:
+        _CLIP_RUNTIME = {}
+        return _CLIP_RUNTIME
+
+    try:
+        model_id = "openai/clip-vit-base-patch32"
+        processor = CLIPProcessor.from_pretrained(model_id)
+        model = CLIPModel.from_pretrained(model_id)
+        model.eval()
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+            model = model.to(device)
+        _CLIP_RUNTIME = {
+            "torch": torch,
+            "Image": Image,
+            "processor": processor,
+            "model": model,
+            "device": device,
+            "model_id": model_id,
+        }
+    except Exception:
+        _CLIP_RUNTIME = {}
+    return _CLIP_RUNTIME
+
+
+def _get_clip_projector(in_dim: int, out_dim: int = 96) -> np.ndarray:
+    global _CLIP_PROJECTOR
+    if _CLIP_PROJECTOR is not None and _CLIP_PROJECTOR.shape == (in_dim, out_dim):
+        return _CLIP_PROJECTOR
+    rng = np.random.default_rng(20260211)
+    mat = rng.normal(0.0, 1.0 / math.sqrt(max(1, in_dim)), size=(in_dim, out_dim)).astype(np.float32)
+    _CLIP_PROJECTOR = mat
+    return _CLIP_PROJECTOR
+
+
+def _embedding_from_frames_clip(frames: Sequence[np.ndarray]) -> List[float] | None:
+    runtime = _ensure_clip_runtime()
+    if not runtime or "model" not in runtime:
+        return None
+    torch = runtime["torch"]
+    processor = runtime["processor"]
+    model = runtime["model"]
+    Image = runtime["Image"]
+    device = runtime["device"]
+
+    if not frames:
+        return None
+    pick = min(8, len(frames))
+    idx = np.linspace(0, len(frames) - 1, pick, dtype=int)
+    images = [Image.fromarray(cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)) for i in idx]
+
+    with torch.no_grad():
+        inputs = processor(images=images, return_tensors="pt")
+        if device == "cuda":
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        features = model.get_image_features(**inputs)
+        features = features / torch.clamp(features.norm(dim=-1, keepdim=True), min=1e-6)
+        pooled = features.mean(dim=0).detach().cpu().numpy().astype(np.float32)
+
+    proj = _get_clip_projector(in_dim=int(pooled.shape[0]), out_dim=96)
+    emb = pooled @ proj
+    norm = float(np.linalg.norm(emb))
+    if norm > 1e-9:
+        emb = emb / norm
+    return emb.astype(np.float32).tolist()
+
+
+def _normalize_01(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return values.astype(np.float32)
+    arr = values.astype(np.float32)
+    lo = float(np.min(arr))
+    hi = float(np.max(arr))
+    if hi - lo < 1e-9:
+        return np.zeros_like(arr, dtype=np.float32)
+    return ((arr - lo) / (hi - lo)).astype(np.float32)
+
+
+def _smooth_signal(values: np.ndarray, win: int) -> np.ndarray:
+    if values.size == 0 or win <= 1:
+        return values.astype(np.float32)
+    width = max(1, int(win))
+    if width % 2 == 0:
+        width += 1
+    kernel = np.ones(width, dtype=np.float32) / float(width)
+    return np.convolve(values.astype(np.float32), kernel, mode="same")
+
+
+def _detect_structure_peaks(
+    times: np.ndarray,
+    novelty: np.ndarray,
+    duration_s: float,
+    min_gap_s: float = 2.5,
+    quantile: float = 0.88,
+) -> Tuple[List[float], List[float]]:
+    if times.size < 3 or novelty.size < 3:
+        return [], []
+
+    threshold = float(np.quantile(novelty, quantile))
+    step_s = float(np.median(np.diff(times))) if times.size > 1 else 0.023
+    min_gap_frames = max(1, int(round(min_gap_s / max(step_s, 1e-6))))
+
+    peak_indices: List[int] = []
+    peak_values: List[float] = []
+    for idx in range(1, len(novelty) - 1):
+        center = float(novelty[idx])
+        if center < threshold:
+            continue
+        if center < float(novelty[idx - 1]) or center < float(novelty[idx + 1]):
+            continue
+
+        ts_s = float(times[idx])
+        if ts_s < 1.0 or ts_s > duration_s - 1.0:
+            continue
+
+        if peak_indices and idx - peak_indices[-1] < min_gap_frames:
+            if center > peak_values[-1]:
+                peak_indices[-1] = idx
+                peak_values[-1] = center
+            continue
+
+        peak_indices.append(idx)
+        peak_values.append(center)
+
+    if not peak_indices:
+        return [], []
+
+    strength_values = _normalize_01(np.asarray(peak_values, dtype=np.float32))
+    return [float(times[i]) for i in peak_indices], strength_values.astype(np.float32).tolist()
+
+
+def analyze_song(song_path: str, wav_dir: str, sample_rate: int = 22050, beat_model: str = "auto") -> SongAnalysis:
     wav_path = str((Path(wav_dir) / (Path(song_path).stem + ".wav")).resolve())
     convert_audio_to_wav(song_path, wav_path, sample_rate=sample_rate)
 
     y, sr = librosa.load(wav_path, sr=sample_rate, mono=True)
     duration_s = float(librosa.get_duration(y=y, sr=sr))
-    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="frames")
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr).tolist()
+    hop_length = 512
+    beat_times, bpm = _resolve_beat_times(y=y, sr=sr, wav_path=wav_path, hop_length=hop_length, beat_model=beat_model)
+    beat_frames = librosa.time_to_frames(beat_times, sr=sr, hop_length=hop_length).astype(int)
 
-    onset = librosa.onset.onset_strength(y=y, sr=sr)
-    if len(beat_frames) > 0:
+    onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length).astype(np.float32)
+    if not np.isfinite(bpm) or bpm <= 0:
+        bpm = 120.0
+
+    if len(beat_frames) > 0 and len(onset) > 0:
         idx = np.clip(beat_frames, 0, len(onset) - 1)
-        strengths = onset[idx].astype(np.float32)
-        if strengths.max() > strengths.min():
-            strengths = (strengths - strengths.min()) / (strengths.max() - strengths.min())
-        else:
-            strengths = np.zeros_like(strengths)
+        strengths = _normalize_01(onset[idx].astype(np.float32))
         beat_strengths = strengths.tolist()
     else:
-        bpm = float(tempo) if np.size(tempo) == 1 else float(np.mean(tempo))
         interval = 60.0 / max(bpm, 120.0)
         beat_times = list(np.arange(0.0, duration_s, interval))
         beat_strengths = [0.5] * len(beat_times)
 
-    bpm = float(tempo) if np.size(tempo) == 1 else float(np.mean(tempo))
+    rms = librosa.feature.rms(y=y, hop_length=hop_length).squeeze().astype(np.float32)
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length).squeeze().astype(np.float32)
+
+    frame_count = int(min(len(onset), len(rms), len(centroid)))
+    onset = onset[:frame_count]
+    rms = rms[:frame_count]
+    centroid = centroid[:frame_count]
+    tension_times = librosa.frames_to_time(np.arange(frame_count), sr=sr, hop_length=hop_length).astype(np.float32)
+
+    if frame_count > 0:
+        onset_n = _normalize_01(onset)
+        rms_n = _normalize_01(rms)
+        centroid_n = _normalize_01(centroid)
+        tension_raw = 0.50 * onset_n + 0.35 * rms_n + 0.15 * centroid_n
+        tension_values = _smooth_signal(tension_raw, win=9)
+    else:
+        tension_values = np.zeros((0,), dtype=np.float32)
+
+    if frame_count > 1:
+        try:
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length).astype(np.float32)
+            chroma = chroma[:, :frame_count]
+            chroma_jump = np.linalg.norm(np.diff(chroma, axis=1, prepend=chroma[:, :1]), axis=0).astype(np.float32)
+        except Exception:
+            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop_length).astype(np.float32)
+            mfcc = mfcc[:, :frame_count]
+            chroma_jump = np.linalg.norm(np.diff(mfcc, axis=1, prepend=mfcc[:, :1]), axis=0).astype(np.float32)
+
+        rms_jump = np.abs(np.diff(_normalize_01(rms), prepend=_normalize_01(rms[:1]))).astype(np.float32)
+        tension_jump = np.abs(
+            np.diff(_normalize_01(tension_values), prepend=_normalize_01(tension_values[:1]))
+        ).astype(np.float32)
+        common_len = int(min(len(chroma_jump), len(rms_jump), len(tension_jump), len(tension_times), len(tension_values)))
+        chroma_jump = chroma_jump[:common_len]
+        rms_jump = rms_jump[:common_len]
+        tension_jump = tension_jump[:common_len]
+        tension_times = tension_times[:common_len]
+        tension_values = tension_values[:common_len]
+        novelty = (
+            0.55 * _normalize_01(chroma_jump)
+            + 0.25 * _normalize_01(tension_jump)
+            + 0.20 * _normalize_01(rms_jump)
+        ).astype(np.float32)
+        novelty = _smooth_signal(novelty, win=11)
+        structure_times, structure_strengths = _detect_structure_peaks(
+            times=tension_times,
+            novelty=novelty,
+            duration_s=duration_s,
+            min_gap_s=2.5,
+            quantile=0.88,
+        )
+    else:
+        structure_times, structure_strengths = [], []
+
     return SongAnalysis(
         path=str(Path(song_path).resolve()),
         wav_path=wav_path,
@@ -148,6 +400,10 @@ def analyze_song(song_path: str, wav_dir: str, sample_rate: int = 22050) -> Song
         bpm=bpm,
         beat_times=beat_times,
         beat_strengths=beat_strengths,
+        tension_times=tension_times.tolist(),
+        tension_values=tension_values.astype(np.float32).tolist(),
+        structure_times=structure_times,
+        structure_strengths=structure_strengths,
     )
 
 
@@ -272,6 +528,7 @@ def _extract_clip_features_from_sampled_frames(
     timestamps: Sequence[float],
     frames: Sequence[np.ndarray],
     segments: Sequence[Tuple[float, float]],
+    embedding_model: str,
 ) -> List[ClipFeature]:
     results: List[ClipFeature] = []
     if len(timestamps) != len(frames) or not timestamps:
@@ -299,7 +556,7 @@ def _extract_clip_features_from_sampled_frames(
         emb_pick_count = min(12, len(selected_frames))
         emb_idx = np.linspace(0, len(selected_frames) - 1, emb_pick_count, dtype=int)
         emb_frames = [selected_frames[i] for i in emb_idx]
-        embedding = _embedding_from_frames(emb_frames, bins=32)
+        embedding = _embedding_from_frames(emb_frames, bins=32, embedding_model=embedding_model)
 
         results.append(
             ClipFeature(
@@ -316,6 +573,81 @@ def _extract_clip_features_from_sampled_frames(
     return results
 
 
+def _restrict_segments_to_window(
+    segments: Sequence[Tuple[float, float]],
+    win_start_s: float,
+    win_end_s: float,
+    min_len_s: float,
+) -> List[Tuple[float, float]]:
+    restricted: List[Tuple[float, float]] = []
+    for seg_start_s, seg_end_s in segments:
+        start_s = max(seg_start_s, win_start_s)
+        end_s = min(seg_end_s, win_end_s)
+        if end_s - start_s >= min_len_s:
+            restricted.append((start_s, end_s))
+    return restricted
+
+
+def extract_movie_chunk_features(
+    movie_path: str,
+    movie_duration_s: float,
+    chunk_start_s: float,
+    chunk_end_s: float,
+    scene_threshold: float,
+    min_scene_len_s: float,
+    sample_fps: float,
+    min_clip_s: float,
+    max_clip_s: float,
+    max_clips_for_chunk: int,
+    chunk_overlap_s: float,
+    sample_width: int,
+    use_gpu_decode: bool,
+    embedding_model: str = "hist96",
+) -> Tuple[List[ClipFeature], int]:
+    extended_start_s = max(0.0, chunk_start_s - max(0.0, chunk_overlap_s))
+    extended_end_s = min(movie_duration_s, chunk_end_s + max(0.0, chunk_overlap_s))
+
+    timestamps, frames = _extract_chunk_sampled_frames(
+        video_path=movie_path,
+        chunk_start_s=extended_start_s,
+        chunk_end_s=extended_end_s,
+        sample_fps=sample_fps,
+        sample_width=sample_width,
+        use_gpu_decode=use_gpu_decode,
+    )
+    if len(frames) < 2:
+        return [], 0
+
+    scenes = _detect_scene_segments_from_sampled_frames(
+        timestamps=timestamps,
+        frames=frames,
+        chunk_start_s=extended_start_s,
+        chunk_end_s=extended_end_s,
+        scene_threshold=scene_threshold,
+        min_scene_len_s=min_scene_len_s,
+    )
+    segments = build_clip_segments(
+        scenes=scenes,
+        min_clip_s=min_clip_s,
+        max_clip_s=max_clip_s,
+        max_clips=max_clips_for_chunk,
+    )
+    segments = _restrict_segments_to_window(
+        segments=segments,
+        win_start_s=chunk_start_s,
+        win_end_s=chunk_end_s,
+        min_len_s=min_clip_s,
+    )
+    chunk_clips = _extract_clip_features_from_sampled_frames(
+        movie_path=movie_path,
+        timestamps=timestamps,
+        frames=frames,
+        segments=segments,
+        embedding_model=embedding_model,
+    )
+    return chunk_clips, len(scenes)
+
+
 def extract_movie_clip_features_chunked(
     video_meta: VideoMeta,
     scene_threshold: float,
@@ -329,68 +661,31 @@ def extract_movie_clip_features_chunked(
     chunk_overlap_s: float,
     sample_width: int,
     use_gpu_decode: bool,
+    embedding_model: str = "hist96",
 ) -> Tuple[List[ClipFeature], dict]:
     chunks = build_time_chunks(video_meta.duration_s, min_chunk_s=chunk_min_s, max_chunk_s=chunk_max_s)
     all_clips: List[ClipFeature] = []
     total_scenes = 0
 
-    def _restrict_segments_to_window(
-        segments: Sequence[Tuple[float, float]],
-        win_start_s: float,
-        win_end_s: float,
-        min_len_s: float,
-    ) -> List[Tuple[float, float]]:
-        restricted: List[Tuple[float, float]] = []
-        for seg_start_s, seg_end_s in segments:
-            start_s = max(seg_start_s, win_start_s)
-            end_s = min(seg_end_s, win_end_s)
-            if end_s - start_s >= min_len_s:
-                restricted.append((start_s, end_s))
-        return restricted
-
     for chunk_start_s, chunk_end_s in chunks:
-        extended_start_s = max(0.0, chunk_start_s - max(0.0, chunk_overlap_s))
-        extended_end_s = min(video_meta.duration_s, chunk_end_s + max(0.0, chunk_overlap_s))
-        timestamps, frames = _extract_chunk_sampled_frames(
-            video_path=video_meta.path,
-            chunk_start_s=extended_start_s,
-            chunk_end_s=extended_end_s,
-            sample_fps=sample_fps,
-            sample_width=sample_width,
-            use_gpu_decode=use_gpu_decode,
-        )
-        if len(frames) < 2:
-            continue
-
-        scenes = _detect_scene_segments_from_sampled_frames(
-            timestamps=timestamps,
-            frames=frames,
-            chunk_start_s=extended_start_s,
-            chunk_end_s=extended_end_s,
+        chunk_cap = max(8, int(math.ceil(max_clips_per_movie / max(1, len(chunks)))))
+        chunk_clips, scene_count = extract_movie_chunk_features(
+            movie_path=video_meta.path,
+            movie_duration_s=video_meta.duration_s,
+            chunk_start_s=chunk_start_s,
+            chunk_end_s=chunk_end_s,
             scene_threshold=scene_threshold,
             min_scene_len_s=min_scene_len_s,
-        )
-        total_scenes += len(scenes)
-
-        chunk_cap = max(8, int(math.ceil(max_clips_per_movie / max(1, len(chunks)))))
-        segments = build_clip_segments(
-            scenes=scenes,
+            sample_fps=sample_fps,
             min_clip_s=min_clip_s,
             max_clip_s=max_clip_s,
-            max_clips=chunk_cap,
+            max_clips_for_chunk=chunk_cap,
+            chunk_overlap_s=chunk_overlap_s,
+            sample_width=sample_width,
+            use_gpu_decode=use_gpu_decode,
+            embedding_model=embedding_model,
         )
-        segments = _restrict_segments_to_window(
-            segments=segments,
-            win_start_s=chunk_start_s,
-            win_end_s=chunk_end_s,
-            min_len_s=min_clip_s,
-        )
-        chunk_clips = _extract_clip_features_from_sampled_frames(
-            movie_path=video_meta.path,
-            timestamps=timestamps,
-            frames=frames,
-            segments=segments,
-        )
+        total_scenes += scene_count
         all_clips.extend(chunk_clips)
 
     dedup: dict[tuple[str, int, int], ClipFeature] = {}
@@ -497,9 +792,16 @@ def _read_frame_at(cap: cv2.VideoCapture, ts_s: float) -> np.ndarray | None:
     return frame
 
 
-def _embedding_from_frames(frames: Iterable[np.ndarray], bins: int = 32) -> List[float]:
+def _embedding_from_frames(frames: Iterable[np.ndarray], bins: int = 32, embedding_model: str = "hist96") -> List[float]:
+    frame_list = list(frames)
+    mode = (embedding_model or "hist96").lower().strip()
+    if mode in {"auto", "clip"}:
+        clip_embedding = _embedding_from_frames_clip(frame_list)
+        if clip_embedding is not None:
+            return clip_embedding
+
     vectors = []
-    for frame in frames:
+    for frame in frame_list:
         ch_features = []
         for ch in range(3):
             hist = cv2.calcHist([frame], [ch], None, [bins], [0, 256])
@@ -517,7 +819,11 @@ def _embedding_from_frames(frames: Iterable[np.ndarray], bins: int = 32) -> List
     return emb.astype(np.float32).tolist()
 
 
-def extract_clip_features(video_meta: VideoMeta, segments: Sequence[Tuple[float, float]]) -> List[ClipFeature]:
+def extract_clip_features(
+    video_meta: VideoMeta,
+    segments: Sequence[Tuple[float, float]],
+    embedding_model: str = "hist96",
+) -> List[ClipFeature]:
     cap = cv2.VideoCapture(video_meta.path)
     if not cap.isOpened():
         raise MediaError(f"Cannot open video: {video_meta.path}")
@@ -548,7 +854,7 @@ def extract_clip_features(video_meta: VideoMeta, segments: Sequence[Tuple[float,
         brightness = float(np.mean([np.mean(hsv[:, :, 2]) / 255.0 for hsv in hsvs]))
         saturation = float(np.mean([np.mean(hsv[:, :, 1]) / 255.0 for hsv in hsvs]))
         motion_energy = float(np.mean(motions)) if motions else 0.0
-        embedding = _embedding_from_frames(frames, bins=32)
+        embedding = _embedding_from_frames(frames, bins=32, embedding_model=embedding_model)
 
         results.append(
             ClipFeature(

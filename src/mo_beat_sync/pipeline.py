@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -13,9 +14,11 @@ from .media import (
     AUDIO_EXTS,
     VIDEO_EXTS,
     analyze_song,
+    build_time_chunks,
     check_tools,
     detect_ffmpeg_capabilities,
-    extract_movie_clip_features_chunked,
+    extract_movie_chunk_features,
+    file_sha256,
     list_media_files,
     read_video_meta,
     write_report_json,
@@ -24,6 +27,8 @@ from .planner import build_beat_slots, plan_clips
 from .renderer import render_final_video
 
 DEFAULT_WORKERS = max(1, min(8, (os.cpu_count() or 4) // 2))
+SONG_ANALYSIS_VERSION = "song_v2_sr22050_hop512_tension_structure"
+VIDEO_FEATURE_VERSION = "video_v2_chunk_scene_embed96"
 
 
 @dataclass
@@ -58,6 +63,13 @@ class PipelineConfig:
     gpu_mode: str = "auto"
     workers: int = DEFAULT_WORKERS
     song_keyword: str = ""
+    beat_model: str = "auto"
+    embedding_model: str = "auto"
+    planner_beam_width: int = 10
+    planner_per_state_candidates: int = 18
+    planner_slot_skip_penalty: float = 0.45
+    planner_min_reuse_gap: int = 4
+    planner_reuse_penalty: float = 0.14
 
 
 class PipelineError(RuntimeError):
@@ -82,36 +94,108 @@ def _safe_config(cfg: PipelineConfig) -> dict:
     return payload
 
 
-def _process_one_movie(
+def _build_song_analysis_sig(mode: str) -> str:
+    return f"{SONG_ANALYSIS_VERSION}_beat_{mode}"
+
+
+def _build_video_feature_sig(config: PipelineConfig, embedding_mode: str) -> str:
+    payload = (
+        f"scene={config.scene_threshold:.4f}|"
+        f"minscene={config.min_scene_len_s:.3f}|"
+        f"sfps={config.scene_sample_fps:.3f}|"
+        f"minclip={config.min_clip_s:.3f}|"
+        f"maxclip={config.max_clip_s:.3f}|"
+        f"samplew={config.sample_width}|"
+        f"chunkmin={config.chunk_min_minutes:.3f}|"
+        f"chunkmax={config.chunk_max_minutes:.3f}|"
+        f"overlap={config.chunk_overlap_seconds:.3f}|"
+        f"maxclips={config.max_clips_per_movie}|"
+        f"embedding={embedding_mode}"
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:20]
+    return f"{VIDEO_FEATURE_VERSION}_{digest}"
+
+
+def _resolve_beat_mode(requested_mode: str) -> str:
+    mode = (requested_mode or "auto").lower().strip()
+    if mode == "librosa":
+        return mode
+    if mode == "madmom":
+        try:
+            import madmom.features.beats  # type: ignore
+
+            return "madmom"
+        except Exception:
+            return "librosa"
+    try:
+        import madmom.features.beats  # type: ignore
+
+        return "madmom"
+    except Exception:
+        return "librosa"
+
+
+def _resolve_embedding_mode(requested_mode: str) -> str:
+    mode = (requested_mode or "auto").lower().strip()
+    if mode == "hist96":
+        return mode
+    if mode == "clip":
+        try:
+            import torch  # type: ignore
+            import transformers  # type: ignore
+            from PIL import Image  # noqa: F401
+
+            _ = torch
+            _ = transformers
+            return "clip"
+        except Exception:
+            return "hist96"
+    try:
+        import torch  # type: ignore
+        import transformers  # type: ignore
+        from PIL import Image  # noqa: F401
+
+        _ = torch
+        _ = transformers
+        return "clip"
+    except Exception:
+        return "hist96"
+
+
+def _process_one_chunk(
     movie_path: str,
+    movie_checksum: str,
+    movie_duration_s: float,
+    chunk_start_s: float,
+    chunk_end_s: float,
+    max_clips_for_chunk: int,
     scene_threshold: float,
     min_scene_len_s: float,
     scene_sample_fps: float,
     min_clip_s: float,
     max_clip_s: float,
-    max_clips_per_movie: int,
-    chunk_min_minutes: float,
-    chunk_max_minutes: float,
     chunk_overlap_seconds: float,
     sample_width: int,
     use_gpu_decode: bool,
-) -> tuple[list, dict]:
-    video_meta = read_video_meta(movie_path)
-    clips, report = extract_movie_clip_features_chunked(
-        video_meta=video_meta,
+    embedding_model: str,
+) -> tuple[str, str, float, float, list, int]:
+    clips, scene_count = extract_movie_chunk_features(
+        movie_path=movie_path,
+        movie_duration_s=movie_duration_s,
+        chunk_start_s=chunk_start_s,
+        chunk_end_s=chunk_end_s,
         scene_threshold=scene_threshold,
         min_scene_len_s=min_scene_len_s,
         sample_fps=scene_sample_fps,
         min_clip_s=min_clip_s,
         max_clip_s=max_clip_s,
-        max_clips_per_movie=max_clips_per_movie,
-        chunk_min_s=chunk_min_minutes * 60.0,
-        chunk_max_s=chunk_max_minutes * 60.0,
+        max_clips_for_chunk=max_clips_for_chunk,
         chunk_overlap_s=chunk_overlap_seconds,
         sample_width=sample_width,
         use_gpu_decode=use_gpu_decode,
+        embedding_model=embedding_model,
     )
-    return clips, report
+    return movie_path, movie_checksum, chunk_start_s, chunk_end_s, clips, scene_count
 
 
 def run_pipeline(config: PipelineConfig) -> dict:
@@ -130,6 +214,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
     else:
         use_gpu_decode = caps["cuda_hwaccel"]
         use_gpu_encode = caps["nvenc"]
+    beat_mode = _resolve_beat_mode(config.beat_model)
+    embedding_mode = _resolve_embedding_mode(config.embedding_model)
 
     movies = list_media_files(config.movies_dir, VIDEO_EXTS)
     songs = list_media_files(config.songs_dir, AUDIO_EXTS)
@@ -158,69 +244,171 @@ def run_pipeline(config: PipelineConfig) -> dict:
         run_id = db.start_run(_safe_config(config))
 
         wav_dir = str((Path(config.workdir) / "wav_cache").resolve())
-        song = analyze_song(song_path=song_path, wav_dir=wav_dir)
-        song_id = db.insert_song(run_id, song)
+        song_checksum = file_sha256(song_path)
+        song_sig = _build_song_analysis_sig(beat_mode)
+        cached_song = db.find_song_cache(song_checksum, song_sig)
+        if cached_song is not None:
+            cached_song_id = int(cached_song["song_id"])
+            song = db.load_song_analysis(cached_song_id)
+            song.path = song_path
+            song.checksum = song_checksum
+            song.analysis_sig = song_sig
+            song_id = db.clone_song_to_run(
+                run_id=run_id,
+                cached_song_id=cached_song_id,
+                song_path=song_path,
+                wav_path=song.wav_path,
+            )
+            song_cached = True
+        else:
+            song = analyze_song(song_path=song_path, wav_dir=wav_dir, beat_model=beat_mode)
+            song.checksum = song_checksum
+            song.analysis_sig = song_sig
+            song_id = db.insert_song(run_id, song)
+            song_cached = False
+
+        video_feature_sig = _build_video_feature_sig(config, embedding_mode=embedding_mode)
+        movie_checksums: list[str] = []
+        tasks: list[tuple[str, str, float, float, float, int]] = []
+        movie_reports_map: dict[str, dict] = {}
+        for movie_path in movies:
+            video_meta = read_video_meta(movie_path)
+            movie_checksum = file_sha256(movie_path)
+            movie_checksums.append(movie_checksum)
+            cached_clip_count = db.count_cached_clips(movie_checksum=movie_checksum, feature_sig=video_feature_sig)
+            chunks = build_time_chunks(
+                duration_s=video_meta.duration_s,
+                min_chunk_s=config.chunk_min_minutes * 60.0,
+                max_chunk_s=config.chunk_max_minutes * 60.0,
+            )
+            if not chunks:
+                continue
+            movie_reports_map[movie_path] = {
+                "movie_path": movie_path,
+                "movie_checksum": movie_checksum,
+                "duration_s": video_meta.duration_s,
+                "chunk_count": len(chunks),
+                "scene_count": 0,
+                "clip_count": cached_clip_count,
+                "cache_hit": cached_clip_count > 0,
+            }
+            if cached_clip_count > 0:
+                continue
+            chunk_cap = max(8, int((config.max_clips_per_movie + len(chunks) - 1) / len(chunks)))
+            for chunk_start_s, chunk_end_s in chunks:
+                tasks.append(
+                    (
+                        movie_path,
+                        movie_checksum,
+                        video_meta.duration_s,
+                        chunk_start_s,
+                        chunk_end_s,
+                        chunk_cap,
+                    )
+                )
 
         all_clips = []
-        movie_reports = []
-        worker_count = max(1, min(config.workers, len(movies)))
-        if worker_count == 1:
-            for movie_path in movies:
-                clips, report = _process_one_movie(
-                    movie_path=movie_path,
-                    scene_threshold=config.scene_threshold,
-                    min_scene_len_s=config.min_scene_len_s,
-                    scene_sample_fps=config.scene_sample_fps,
-                    min_clip_s=config.min_clip_s,
-                    max_clip_s=config.max_clip_s,
-                    max_clips_per_movie=config.max_clips_per_movie,
-                    chunk_min_minutes=config.chunk_min_minutes,
-                    chunk_max_minutes=config.chunk_max_minutes,
-                    chunk_overlap_seconds=config.chunk_overlap_seconds,
-                    sample_width=config.sample_width,
-                    use_gpu_decode=use_gpu_decode,
-                )
-                all_clips.extend(clips)
-                movie_reports.append(report)
-        else:
-            with ProcessPoolExecutor(max_workers=worker_count) as pool:
-                futures = {
-                    pool.submit(
-                        _process_one_movie,
+        if tasks:
+            worker_count = max(1, min(config.workers, len(tasks)))
+            if worker_count == 1:
+                for movie_path, movie_checksum, movie_duration_s, chunk_start_s, chunk_end_s, chunk_cap in tasks:
+                    _, _, _, _, clips, scene_count = _process_one_chunk(
                         movie_path,
+                        movie_checksum,
+                        movie_duration_s,
+                        chunk_start_s,
+                        chunk_end_s,
+                        chunk_cap,
                         config.scene_threshold,
                         config.min_scene_len_s,
                         config.scene_sample_fps,
                         config.min_clip_s,
                         config.max_clip_s,
-                        config.max_clips_per_movie,
-                        config.chunk_min_minutes,
-                        config.chunk_max_minutes,
                         config.chunk_overlap_seconds,
                         config.sample_width,
                         use_gpu_decode,
-                    ): movie_path
-                    for movie_path in movies
-                }
-                for future in as_completed(futures):
-                    movie_path = futures[future]
-                    try:
-                        clips, report = future.result()
-                    except Exception as exc:
-                        raise PipelineError(f"Movie processing failed: {movie_path}, error={exc}") from exc
+                        embedding_mode,
+                    )
+                    for clip in clips:
+                        clip.movie_checksum = movie_checksum
+                        clip.feature_sig = video_feature_sig
                     all_clips.extend(clips)
-                    movie_reports.append(report)
+                    movie_reports_map[movie_path]["scene_count"] += scene_count
+                    movie_reports_map[movie_path]["clip_count"] += len(clips)
+            else:
+                with ProcessPoolExecutor(max_workers=worker_count) as pool:
+                    futures = {
+                        pool.submit(
+                            _process_one_chunk,
+                            movie_path,
+                            movie_checksum,
+                            movie_duration_s,
+                            chunk_start_s,
+                            chunk_end_s,
+                            chunk_cap,
+                            config.scene_threshold,
+                            config.min_scene_len_s,
+                            config.scene_sample_fps,
+                            config.min_clip_s,
+                            config.max_clip_s,
+                            config.chunk_overlap_seconds,
+                            config.sample_width,
+                            use_gpu_decode,
+                            embedding_mode,
+                        ): (movie_path, movie_checksum, chunk_start_s, chunk_end_s)
+                        for movie_path, movie_checksum, movie_duration_s, chunk_start_s, chunk_end_s, chunk_cap in tasks
+                    }
+                    for future in as_completed(futures):
+                        chunk_info = futures[future]
+                        try:
+                            movie_path, movie_checksum, _, _, clips, scene_count = future.result()
+                        except Exception as exc:
+                            raise PipelineError(
+                                f"Chunk processing failed: movie={chunk_info[0]}, chunk=({chunk_info[2]:.2f},{chunk_info[3]:.2f}), error={exc}"
+                            ) from exc
+                        for clip in clips:
+                            clip.movie_checksum = movie_checksum
+                            clip.feature_sig = video_feature_sig
+                        all_clips.extend(clips)
+                        movie_reports_map[movie_path]["scene_count"] += scene_count
+                        movie_reports_map[movie_path]["clip_count"] += len(clips)
 
-        movie_reports.sort(key=lambda x: x["movie_path"])
+        dedup: dict[tuple[str, int, int], object] = {}
+        for clip in all_clips:
+            key = (clip.movie_checksum or clip.movie_path, int(round(clip.start_s * 1000.0)), int(round(clip.end_s * 1000.0)))
+            if key not in dedup:
+                dedup[key] = clip
+        deduped_clips = list(dedup.values())
+
+        clips_by_movie: dict[str, list] = {}
+        for clip in deduped_clips:
+            clips_by_movie.setdefault(clip.movie_path, []).append(clip)
+
+        all_clips = []
+        for movie_path, clips in clips_by_movie.items():
+            clips.sort(key=lambda x: (x.start_s, x.end_s))
+            if len(clips) > config.max_clips_per_movie:
+                step = (len(clips) - 1) / max(1, config.max_clips_per_movie - 1)
+                pick = [clips[int(round(i * step))] for i in range(config.max_clips_per_movie)]
+                clips = pick
+            movie_reports_map[movie_path]["clip_count"] = len(clips)
+            all_clips.extend(clips)
+
+        movie_reports = sorted(movie_reports_map.values(), key=lambda x: x["movie_path"])
 
         inserted = db.insert_clips(run_id, all_clips)
-        if inserted <= 0:
-            raise PipelineError("No clip features were inserted into MatrixOne")
+        available_clips = db.count_clips_for_assets(movie_checksums=movie_checksums, feature_sig=video_feature_sig)
+        if available_clips <= 0:
+            raise PipelineError("No clip features available in MatrixOne for selected movies")
 
         duration_limit = min(song.duration_s, config.target_duration_s)
         slots = build_beat_slots(
             beat_times=song.beat_times,
             beat_strengths=song.beat_strengths,
+            tension_times=song.tension_times,
+            tension_values=song.tension_values,
+            structure_times=song.structure_times,
+            structure_strengths=song.structure_strengths,
             duration_limit_s=duration_limit,
             beats_per_clip=config.beats_per_clip,
             min_slot_s=config.min_slot_s,
@@ -228,9 +416,27 @@ def run_pipeline(config: PipelineConfig) -> dict:
         if not slots:
             raise PipelineError("No beat slots generated")
 
-        planned = plan_clips(db=db, run_id=run_id, slots=slots)
+        planned = plan_clips(
+            db=db,
+            slots=slots,
+            movie_checksums=movie_checksums,
+            feature_sig=video_feature_sig,
+            beam_width=config.planner_beam_width,
+            per_state_candidates=config.planner_per_state_candidates,
+            slot_skip_penalty=config.planner_slot_skip_penalty,
+            min_reuse_gap=config.planner_min_reuse_gap,
+            reuse_penalty=config.planner_reuse_penalty,
+        )
         if not planned:
             raise PipelineError("No clips selected for edit plan")
+        boundary_slot_count = sum(1 for s in slots if s.boundary_strength >= 0.55)
+        boundary_plan_count = sum(1 for p in planned if p.boundary_strength >= 0.55)
+        avg_tension_distance = (
+            sum(float(p.tension_distance) for p in planned) / max(1, len(planned))
+        )
+        avg_transition_distance = (
+            sum(float(p.transition_distance) for p in planned) / max(1, len(planned))
+        )
 
         plan_id = db.create_plan(run_id=run_id, song_id=song_id, output_path=config.output_path, slot_count=len(slots))
         db.insert_plan_items(plan_id, planned)
@@ -255,11 +461,22 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 "duration_s": song.duration_s,
                 "bpm": song.bpm,
                 "beats": len(song.beat_times),
+                "structure_boundaries": len(song.structure_times),
+                "tension_samples": len(song.tension_values),
+                "cache_hit": song_cached,
+                "beat_model": beat_mode,
             },
             "movies": movie_reports,
             "clip_inserted": inserted,
+            "clip_available": available_clips,
             "slot_count": len(slots),
             "planned_count": len(planned),
+            "alignment": {
+                "boundary_slot_count": boundary_slot_count,
+                "boundary_planned_count": boundary_plan_count,
+                "avg_tension_distance": avg_tension_distance,
+                "avg_transition_distance": avg_transition_distance,
+            },
             "plan_id": plan_id,
             "final_video": final_video,
             "matrixone_summary": summary,
@@ -268,6 +485,17 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 "ffmpeg_caps": caps,
                 "decode_enabled": use_gpu_decode,
                 "encode_enabled": use_gpu_encode,
+            },
+            "models": {
+                "beat_model_requested": config.beat_model,
+                "beat_model_resolved": beat_mode,
+                "embedding_model_requested": config.embedding_model,
+                "embedding_model_resolved": embedding_mode,
+                "planner_beam_width": config.planner_beam_width,
+                "planner_per_state_candidates": config.planner_per_state_candidates,
+                "planner_slot_skip_penalty": config.planner_slot_skip_penalty,
+                "planner_min_reuse_gap": config.planner_min_reuse_gap,
+                "planner_reuse_penalty": config.planner_reuse_penalty,
             },
         }
 
